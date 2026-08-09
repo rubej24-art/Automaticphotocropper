@@ -1,0 +1,1101 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$SettingsFile
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+function Test-HexColor {
+    param([string]$Value)
+    return $Value -match '^#[0-9A-Fa-f]{6}$'
+}
+
+function Convert-HexToColor {
+    param([string]$Value)
+
+    if (-not (Test-HexColor -Value $Value)) {
+        throw "Неверный ручной цвет: $Value"
+    }
+
+    return [System.Drawing.ColorTranslator]::FromHtml($Value)
+}
+
+function Apply-ExifOrientation {
+    param([System.Drawing.Image]$Image)
+
+    $orientationId = 0x0112
+
+    try {
+        if ($Image.PropertyIdList -notcontains $orientationId) {
+            return
+        }
+
+        $orientation = [int]$Image.GetPropertyItem($orientationId).Value[0]
+
+        switch ($orientation) {
+            2 { $Image.RotateFlip([System.Drawing.RotateFlipType]::RotateNoneFlipX) }
+            3 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipNone) }
+            4 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipX) }
+            5 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipX) }
+            6 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipNone) }
+            7 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate270FlipX) }
+            8 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate270FlipNone) }
+        }
+    }
+    catch {
+        # Ошибка EXIF не должна останавливать всю обработку.
+    }
+}
+
+function Get-EdgeAverageColor {
+    param(
+        [System.Drawing.Bitmap]$Bitmap,
+        [ValidateSet('Left', 'Right', 'Top', 'Bottom')]
+        [string]$Edge,
+        [int]$SampleSize
+    )
+
+    [int]$bitmapWidth = $Bitmap.Width
+    [int]$bitmapHeight = $Bitmap.Height
+    [int]$band = 1
+
+    if ($Edge -eq 'Left' -or $Edge -eq 'Right') {
+        $band = [Math]::Min(
+            [int]$SampleSize,
+            [Math]::Max(1, [int][Math]::Floor($bitmapWidth / 4.0))
+        )
+    }
+    else {
+        $band = [Math]::Min(
+            [int]$SampleSize,
+            [Math]::Max(1, [int][Math]::Floor($bitmapHeight / 4.0))
+        )
+    }
+
+    [int]$startX = 0
+    [int]$startY = 0
+    [int]$endX = $bitmapWidth
+    [int]$endY = $bitmapHeight
+
+    switch ($Edge) {
+        'Left' {
+            $endX = $band
+        }
+        'Right' {
+            $startX = [int]($bitmapWidth - $band)
+        }
+        'Top' {
+            $endY = $band
+        }
+        'Bottom' {
+            $startY = [int]($bitmapHeight - $band)
+        }
+    }
+
+    [long]$allR = 0
+    [long]$allG = 0
+    [long]$allB = 0
+    [long]$allCount = 0
+
+    [long]$filteredR = 0
+    [long]$filteredG = 0
+    [long]$filteredB = 0
+    [long]$filteredCount = 0
+
+    for ([int]$y = $startY; $y -lt $endY; $y++) {
+        for ([int]$x = $startX; $x -lt $endX; $x++) {
+            $pixel = $Bitmap.GetPixel($x, $y)
+
+            if ($pixel.A -lt 128) {
+                continue
+            }
+
+            $allR += [int]$pixel.R
+            $allG += [int]$pixel.G
+            $allB += [int]$pixel.B
+            $allCount++
+
+            if ($pixel.GetSaturation() -le 0.40 -and
+                $pixel.GetBrightness() -ge 0.35) {
+                $filteredR += [int]$pixel.R
+                $filteredG += [int]$pixel.G
+                $filteredB += [int]$pixel.B
+                $filteredCount++
+            }
+        }
+    }
+
+    [long]$requiredFiltered = [Math]::Max(
+        20,
+        [long][Math]::Floor($allCount * 0.10)
+    )
+
+    if ($filteredCount -ge $requiredFiltered -and $filteredCount -gt 0) {
+        return [System.Drawing.Color]::FromArgb(
+            [int][Math]::Round($filteredR / [double]$filteredCount),
+            [int][Math]::Round($filteredG / [double]$filteredCount),
+            [int][Math]::Round($filteredB / [double]$filteredCount)
+        )
+    }
+
+    if ($allCount -gt 0) {
+        return [System.Drawing.Color]::FromArgb(
+            [int][Math]::Round($allR / [double]$allCount),
+            [int][Math]::Round($allG / [double]$allCount),
+            [int][Math]::Round($allB / [double]$allCount)
+        )
+    }
+
+    return [System.Drawing.Color]::FromArgb(240, 240, 240)
+}
+
+function Get-AverageColor {
+    param(
+        [System.Drawing.Color]$First,
+        [System.Drawing.Color]$Second
+    )
+
+    return [System.Drawing.Color]::FromArgb(
+        [int][Math]::Round(([int]$First.R + [int]$Second.R) / 2.0),
+        [int][Math]::Round(([int]$First.G + [int]$Second.G) / 2.0),
+        [int][Math]::Round(([int]$First.B + [int]$Second.B) / 2.0)
+    )
+}
+
+function Fill-Solid {
+    param(
+        [System.Drawing.Graphics]$Graphics,
+        [System.Drawing.Rectangle]$Rectangle,
+        [System.Drawing.Color]$Color
+    )
+
+    if ($Rectangle.Width -le 0 -or $Rectangle.Height -le 0) {
+        return
+    }
+
+    $brush = New-Object System.Drawing.SolidBrush($Color)
+
+    try {
+        $Graphics.FillRectangle($brush, $Rectangle)
+    }
+    finally {
+        $brush.Dispose()
+    }
+}
+
+function Fill-Gradient {
+    param(
+        [System.Drawing.Graphics]$Graphics,
+        [System.Drawing.Rectangle]$Rectangle,
+        [System.Drawing.Color]$FirstColor,
+        [System.Drawing.Color]$SecondColor,
+        [System.Drawing.Drawing2D.LinearGradientMode]$Direction
+    )
+
+    if ($Rectangle.Width -le 0 -or $Rectangle.Height -le 0) {
+        return
+    }
+
+    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+        $Rectangle,
+        $FirstColor,
+        $SecondColor,
+        $Direction
+    )
+
+    try {
+        $Graphics.FillRectangle($brush, $Rectangle)
+    }
+    finally {
+        $brush.Dispose()
+    }
+}
+
+
+function Mix-Color {
+    param(
+        [System.Drawing.Color]$PreviousColor,
+        [System.Drawing.Color]$CurrentColor,
+        [double]$CurrentWeight = 0.35
+    )
+
+    $previousWeight = 1.0 - $CurrentWeight
+
+    return [System.Drawing.Color]::FromArgb(
+        [int][Math]::Round(
+            ([int]$PreviousColor.R * $previousWeight) +
+            ([int]$CurrentColor.R * $CurrentWeight)
+        ),
+        [int][Math]::Round(
+            ([int]$PreviousColor.G * $previousWeight) +
+            ([int]$CurrentColor.G * $CurrentWeight)
+        ),
+        [int][Math]::Round(
+            ([int]$PreviousColor.B * $previousWeight) +
+            ([int]$CurrentColor.B * $CurrentWeight)
+        )
+    )
+}
+
+function Get-LineEdgeColor {
+    param(
+        [System.Drawing.Bitmap]$Bitmap,
+
+        [ValidateSet('Left', 'Right', 'Top', 'Bottom')]
+        [string]$Edge,
+
+        [int]$LineIndex,
+        [int]$SampleSize,
+        [int]$SmoothRadius = 2
+    )
+
+    [int]$bitmapWidth = $Bitmap.Width
+    [int]$bitmapHeight = $Bitmap.Height
+
+    [int]$band = 1
+    [int]$startX = 0
+    [int]$endX = $bitmapWidth
+    [int]$startY = 0
+    [int]$endY = $bitmapHeight
+
+    if ($Edge -eq 'Left' -or $Edge -eq 'Right') {
+        $band = [Math]::Min(
+            [int]$SampleSize,
+            [Math]::Max(
+                1,
+                [int][Math]::Floor($bitmapWidth / 4.0)
+            )
+        )
+
+        $startY = [Math]::Max(0, $LineIndex - $SmoothRadius)
+        $endY = [Math]::Min(
+            $bitmapHeight,
+            $LineIndex + $SmoothRadius + 1
+        )
+
+        if ($Edge -eq 'Left') {
+            $startX = 0
+            $endX = $band
+        }
+        else {
+            $startX = [Math]::Max(0, $bitmapWidth - $band)
+            $endX = $bitmapWidth
+        }
+    }
+    else {
+        $band = [Math]::Min(
+            [int]$SampleSize,
+            [Math]::Max(
+                1,
+                [int][Math]::Floor($bitmapHeight / 4.0)
+            )
+        )
+
+        $startX = [Math]::Max(0, $LineIndex - $SmoothRadius)
+        $endX = [Math]::Min(
+            $bitmapWidth,
+            $LineIndex + $SmoothRadius + 1
+        )
+
+        if ($Edge -eq 'Top') {
+            $startY = 0
+            $endY = $band
+        }
+        else {
+            $startY = [Math]::Max(0, $bitmapHeight - $band)
+            $endY = $bitmapHeight
+        }
+    }
+
+    [long]$allR = 0
+    [long]$allG = 0
+    [long]$allB = 0
+    [long]$allCount = 0
+
+    [long]$backgroundR = 0
+    [long]$backgroundG = 0
+    [long]$backgroundB = 0
+    [long]$backgroundCount = 0
+
+    for ([int]$y = $startY; $y -lt $endY; $y++) {
+        for ([int]$x = $startX; $x -lt $endX; $x++) {
+            $pixel = $Bitmap.GetPixel($x, $y)
+
+            if ($pixel.A -lt 128) {
+                continue
+            }
+
+            $allR += [int]$pixel.R
+            $allG += [int]$pixel.G
+            $allB += [int]$pixel.B
+            $allCount++
+
+            # Светлые и не слишком насыщенные пиксели считаются фоном.
+            # Волосы и тёмная одежда обычно не проходят этот фильтр.
+            if ($pixel.GetSaturation() -le 0.45 -and
+                $pixel.GetBrightness() -ge 0.38) {
+                $backgroundR += [int]$pixel.R
+                $backgroundG += [int]$pixel.G
+                $backgroundB += [int]$pixel.B
+                $backgroundCount++
+            }
+        }
+    }
+
+    [long]$requiredBackground = [Math]::Max(
+        3,
+        [long][Math]::Floor($allCount * 0.15)
+    )
+
+    if ($backgroundCount -ge $requiredBackground) {
+        $color = [System.Drawing.Color]::FromArgb(
+            [int][Math]::Round(
+                $backgroundR / [double]$backgroundCount
+            ),
+            [int][Math]::Round(
+                $backgroundG / [double]$backgroundCount
+            ),
+            [int][Math]::Round(
+                $backgroundB / [double]$backgroundCount
+            )
+        )
+
+        return [pscustomobject]@{
+            Color        = $color
+            IsBackground = $true
+        }
+    }
+
+    if ($allCount -gt 0) {
+        $color = [System.Drawing.Color]::FromArgb(
+            [int][Math]::Round($allR / [double]$allCount),
+            [int][Math]::Round($allG / [double]$allCount),
+            [int][Math]::Round($allB / [double]$allCount)
+        )
+
+        return [pscustomobject]@{
+            Color        = $color
+            IsBackground = $false
+        }
+    }
+
+    return [pscustomobject]@{
+        Color        = [System.Drawing.Color]::FromArgb(240, 240, 240)
+        IsBackground = $false
+    }
+}
+
+function Fill-RowMatchBackground {
+    param(
+        [System.Drawing.Graphics]$Graphics,
+        [System.Drawing.Bitmap]$SourceBitmap,
+        [int]$CanvasSize,
+        [int]$DrawX,
+        [int]$DrawY,
+        [int]$DrawWidth,
+        [int]$DrawHeight,
+        [int]$SampleSize,
+        [bool]$PadLeftRight
+    )
+
+    $firstProfile = $null
+    $secondProfile = $null
+
+    try {
+        if ($PadLeftRight) {
+            $leftFallback = Get-EdgeAverageColor `
+                -Bitmap $SourceBitmap `
+                -Edge 'Left' `
+                -SampleSize $SampleSize
+
+            $rightFallback = Get-EdgeAverageColor `
+                -Bitmap $SourceBitmap `
+                -Edge 'Right' `
+                -SampleSize $SampleSize
+
+            $Graphics.Clear(
+                (Get-AverageColor `
+                    -First $leftFallback `
+                    -Second $rightFallback)
+            )
+
+            [int]$leftWidth = $DrawX
+            [int]$rightX = $DrawX + $DrawWidth
+            [int]$rightWidth = $CanvasSize - $rightX
+
+            if ($leftWidth -le 0 -and $rightWidth -le 0) {
+                return
+            }
+
+            $firstProfile = New-Object System.Drawing.Bitmap(
+                1,
+                $CanvasSize,
+                [System.Drawing.Imaging.PixelFormat]::Format24bppRgb
+            )
+
+            $secondProfile = New-Object System.Drawing.Bitmap(
+                1,
+                $CanvasSize,
+                [System.Drawing.Imaging.PixelFormat]::Format24bppRgb
+            )
+
+            $lastLeft = $leftFallback
+            $lastRight = $rightFallback
+            [bool]$hasLeftBackground = $false
+            [bool]$hasRightBackground = $false
+
+            for ([int]$canvasY = 0;
+                $canvasY -lt $CanvasSize;
+                $canvasY++) {
+
+                if ($DrawHeight -le 1) {
+                    [int]$sourceY = 0
+                }
+                else {
+                    [double]$position = (
+                        ($canvasY - $DrawY) /
+                        [double]($DrawHeight - 1)
+                    )
+
+                    $position = [Math]::Max(
+                        0.0,
+                        [Math]::Min(1.0, $position)
+                    )
+
+                    [int]$sourceY = [int][Math]::Round(
+                        $position * ($SourceBitmap.Height - 1)
+                    )
+                }
+
+                $leftResult = Get-LineEdgeColor `
+                    -Bitmap $SourceBitmap `
+                    -Edge 'Left' `
+                    -LineIndex $sourceY `
+                    -SampleSize $SampleSize
+
+                $rightResult = Get-LineEdgeColor `
+                    -Bitmap $SourceBitmap `
+                    -Edge 'Right' `
+                    -LineIndex $sourceY `
+                    -SampleSize $SampleSize
+
+                if ($leftResult.IsBackground) {
+                    if ($hasLeftBackground) {
+                        $lastLeft = Mix-Color `
+                            -PreviousColor $lastLeft `
+                            -CurrentColor $leftResult.Color
+                    }
+                    else {
+                        $lastLeft = $leftResult.Color
+                        $hasLeftBackground = $true
+                    }
+                }
+
+                if ($rightResult.IsBackground) {
+                    if ($hasRightBackground) {
+                        $lastRight = Mix-Color `
+                            -PreviousColor $lastRight `
+                            -CurrentColor $rightResult.Color
+                    }
+                    else {
+                        $lastRight = $rightResult.Color
+                        $hasRightBackground = $true
+                    }
+                }
+
+                $firstProfile.SetPixel(0, $canvasY, $lastLeft)
+                $secondProfile.SetPixel(0, $canvasY, $lastRight)
+            }
+
+            if ($leftWidth -gt 0) {
+                $leftRectangle = New-Object System.Drawing.Rectangle(
+                    0,
+                    0,
+                    $leftWidth,
+                    $CanvasSize
+                )
+
+                $Graphics.DrawImage($firstProfile, $leftRectangle)
+            }
+
+            if ($rightWidth -gt 0) {
+                $rightRectangle = New-Object System.Drawing.Rectangle(
+                    $rightX,
+                    0,
+                    $rightWidth,
+                    $CanvasSize
+                )
+
+                $Graphics.DrawImage($secondProfile, $rightRectangle)
+            }
+
+            return
+        }
+
+        $topFallback = Get-EdgeAverageColor `
+            -Bitmap $SourceBitmap `
+            -Edge 'Top' `
+            -SampleSize $SampleSize
+
+        $bottomFallback = Get-EdgeAverageColor `
+            -Bitmap $SourceBitmap `
+            -Edge 'Bottom' `
+            -SampleSize $SampleSize
+
+        $Graphics.Clear(
+            (Get-AverageColor `
+                -First $topFallback `
+                -Second $bottomFallback)
+        )
+
+        [int]$topHeight = $DrawY
+        [int]$bottomY = $DrawY + $DrawHeight
+        [int]$bottomHeight = $CanvasSize - $bottomY
+
+        if ($topHeight -le 0 -and $bottomHeight -le 0) {
+            return
+        }
+
+        $firstProfile = New-Object System.Drawing.Bitmap(
+            $CanvasSize,
+            1,
+            [System.Drawing.Imaging.PixelFormat]::Format24bppRgb
+        )
+
+        $secondProfile = New-Object System.Drawing.Bitmap(
+            $CanvasSize,
+            1,
+            [System.Drawing.Imaging.PixelFormat]::Format24bppRgb
+        )
+
+        $lastTop = $topFallback
+        $lastBottom = $bottomFallback
+        [bool]$hasTopBackground = $false
+        [bool]$hasBottomBackground = $false
+
+        for ([int]$canvasX = 0;
+            $canvasX -lt $CanvasSize;
+            $canvasX++) {
+
+            if ($DrawWidth -le 1) {
+                [int]$sourceX = 0
+            }
+            else {
+                [double]$position = (
+                    ($canvasX - $DrawX) /
+                    [double]($DrawWidth - 1)
+                )
+
+                $position = [Math]::Max(
+                    0.0,
+                    [Math]::Min(1.0, $position)
+                )
+
+                [int]$sourceX = [int][Math]::Round(
+                    $position * ($SourceBitmap.Width - 1)
+                )
+            }
+
+            $topResult = Get-LineEdgeColor `
+                -Bitmap $SourceBitmap `
+                -Edge 'Top' `
+                -LineIndex $sourceX `
+                -SampleSize $SampleSize
+
+            $bottomResult = Get-LineEdgeColor `
+                -Bitmap $SourceBitmap `
+                -Edge 'Bottom' `
+                -LineIndex $sourceX `
+                -SampleSize $SampleSize
+
+            if ($topResult.IsBackground) {
+                if ($hasTopBackground) {
+                    $lastTop = Mix-Color `
+                        -PreviousColor $lastTop `
+                        -CurrentColor $topResult.Color
+                }
+                else {
+                    $lastTop = $topResult.Color
+                    $hasTopBackground = $true
+                }
+            }
+
+            if ($bottomResult.IsBackground) {
+                if ($hasBottomBackground) {
+                    $lastBottom = Mix-Color `
+                        -PreviousColor $lastBottom `
+                        -CurrentColor $bottomResult.Color
+                }
+                else {
+                    $lastBottom = $bottomResult.Color
+                    $hasBottomBackground = $true
+                }
+            }
+
+            $firstProfile.SetPixel($canvasX, 0, $lastTop)
+            $secondProfile.SetPixel($canvasX, 0, $lastBottom)
+        }
+
+        if ($topHeight -gt 0) {
+            $topRectangle = New-Object System.Drawing.Rectangle(
+                0,
+                0,
+                $CanvasSize,
+                $topHeight
+            )
+
+            $Graphics.DrawImage($firstProfile, $topRectangle)
+        }
+
+        if ($bottomHeight -gt 0) {
+            $bottomRectangle = New-Object System.Drawing.Rectangle(
+                0,
+                $bottomY,
+                $CanvasSize,
+                $bottomHeight
+            )
+
+            $Graphics.DrawImage($secondProfile, $bottomRectangle)
+        }
+    }
+    finally {
+        if ($null -ne $firstProfile) {
+            $firstProfile.Dispose()
+        }
+
+        if ($null -ne $secondProfile) {
+            $secondProfile.Dispose()
+        }
+    }
+}
+
+function Fill-Background {
+    param(
+        [System.Drawing.Graphics]$Graphics,
+        [int]$CanvasSize,
+        [string]$FillMode,
+        [string]$Direction,
+        [System.Drawing.Color]$FirstColor,
+        [System.Drawing.Color]$SecondColor,
+        [System.Drawing.Color]$ManualColor
+    )
+
+    $fullRectangle = New-Object System.Drawing.Rectangle(
+        0,
+        0,
+        $CanvasSize,
+        $CanvasSize
+    )
+
+    if ($FillMode -eq 'manual') {
+        $Graphics.Clear($ManualColor)
+        return
+    }
+
+    if ($FillMode -eq 'gradient') {
+        $gradientDirection =
+            if ($Direction -eq 'Horizontal') {
+                [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal
+            }
+            else {
+                [System.Drawing.Drawing2D.LinearGradientMode]::Vertical
+            }
+
+        Fill-Gradient `
+            -Graphics $Graphics `
+            -Rectangle $fullRectangle `
+            -FirstColor $FirstColor `
+            -SecondColor $SecondColor `
+            -Direction $gradientDirection
+
+        return
+    }
+
+    $average = Get-AverageColor -First $FirstColor -Second $SecondColor
+    $Graphics.Clear($average)
+
+    [int]$half = [int][Math]::Floor($CanvasSize / 2.0)
+    [int]$otherHalf = [int]($CanvasSize - $half)
+
+    if ($Direction -eq 'Horizontal') {
+        $firstRectangle = New-Object System.Drawing.Rectangle(
+            0,
+            0,
+            $half,
+            $CanvasSize
+        )
+
+        $secondRectangle = New-Object System.Drawing.Rectangle(
+            $half,
+            0,
+            $otherHalf,
+            $CanvasSize
+        )
+    }
+    else {
+        $firstRectangle = New-Object System.Drawing.Rectangle(
+            0,
+            0,
+            $CanvasSize,
+            $half
+        )
+
+        $secondRectangle = New-Object System.Drawing.Rectangle(
+            0,
+            $half,
+            $CanvasSize,
+            $otherHalf
+        )
+    }
+
+    Fill-Solid `
+        -Graphics $Graphics `
+        -Rectangle $firstRectangle `
+        -Color $FirstColor
+
+    Fill-Solid `
+        -Graphics $Graphics `
+        -Rectangle $secondRectangle `
+        -Color $SecondColor
+}
+
+function Save-Jpeg {
+    param(
+        [System.Drawing.Bitmap]$Bitmap,
+        [string]$Path,
+        [int]$Quality
+    )
+
+    $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+        Where-Object { $_.MimeType -eq 'image/jpeg' } |
+        Select-Object -First 1
+
+    if ($null -eq $codec) {
+        throw 'JPEG-кодек не найден.'
+    }
+
+    $parameters = New-Object System.Drawing.Imaging.EncoderParameters(1)
+    $qualityParameter = New-Object System.Drawing.Imaging.EncoderParameter(
+        [System.Drawing.Imaging.Encoder]::Quality,
+        [long]$Quality
+    )
+
+    try {
+        $parameters.Param[0] = $qualityParameter
+        $Bitmap.Save($Path, $codec, $parameters)
+    }
+    finally {
+        $qualityParameter.Dispose()
+        $parameters.Dispose()
+    }
+}
+
+try {
+    Add-Type -AssemblyName System.Drawing
+
+    if (-not (Test-Path -LiteralPath $SettingsFile -PathType Leaf)) {
+        throw 'Файл settings.json не найден. Сначала запустите Settings.bat.'
+    }
+
+    $settings = Get-Content -LiteralPath $SettingsFile -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+
+    $inputDir = [string]$settings.InputDir
+    $outputDir = [string]$settings.OutputDir
+    [int]$outputSize = $settings.OutputSize
+    [int]$jpegQuality = $settings.JpegQuality
+    [int]$sampleSize = $settings.SampleSize
+    $fillMode = ([string]$settings.FillMode).ToLowerInvariant()
+    $manualColorText = [string]$settings.ManualColor
+
+    if ([string]::IsNullOrWhiteSpace($inputDir)) {
+        throw 'В настройках не указана исходная папка.'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($outputDir)) {
+        throw 'В настройках не указана выходная папка.'
+    }
+
+    if (-not (Test-Path -LiteralPath $inputDir -PathType Container)) {
+        throw "Исходная папка не найдена: $inputDir"
+    }
+
+    if ($outputSize -lt 32 -or $outputSize -gt 4096) {
+        throw 'Размер результата должен быть от 32 до 4096 пикселей.'
+    }
+
+    if ($jpegQuality -lt 1 -or $jpegQuality -gt 100) {
+        throw 'Качество JPEG должно быть от 1 до 100.'
+    }
+
+    if ($sampleSize -lt 2 -or $sampleSize -gt 100) {
+        throw 'Толщина выборки должна быть от 2 до 100 пикселей.'
+    }
+
+    if ($fillMode -notin @('rowmatch', 'gradient', 'side', 'manual')) {
+        throw "Неизвестный режим заполнения: $fillMode"
+    }
+
+    $manualColor =
+        if ($fillMode -eq 'manual') {
+            Convert-HexToColor -Value $manualColorText
+        }
+        else {
+            [System.Drawing.Color]::White
+        }
+
+    $inputFull = [System.IO.Path]::GetFullPath($inputDir).TrimEnd('\', '/')
+    $outputFull = [System.IO.Path]::GetFullPath($outputDir).TrimEnd('\', '/')
+
+    if ($inputFull.Equals(
+        $outputFull,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'Входная и выходная папки должны отличаться.'
+    }
+
+    New-Item -ItemType Directory -Path $outputFull -Force | Out-Null
+
+    $files = @(
+        Get-ChildItem -LiteralPath $inputFull -File |
+            Where-Object {
+                $_.Extension.ToLowerInvariant() -in
+                    @('.jpg', '.jpeg', '.jfif', '.png')
+            }
+    )
+
+    if ($files.Count -eq 0) {
+        Write-Host 'В исходной папке нет JPG, JPEG, JFIF или PNG.' -ForegroundColor Yellow
+        exit 0
+    }
+
+    Write-Host ''
+    Write-Host "Исходная папка: $inputFull"
+    Write-Host "Выходная папка: $outputFull"
+    Write-Host "Размер результата: ${outputSize}x${outputSize}"
+    Write-Host "Режим фона: $fillMode"
+
+    if ($fillMode -eq 'manual') {
+        Write-Host "Ручной цвет: $manualColorText"
+    }
+
+    Write-Host "Файлов найдено: $($files.Count)"
+    Write-Host ''
+
+    [int]$done = 0
+    [int]$failed = 0
+    [int]$index = 0
+
+    foreach ($file in $files) {
+        $index++
+        $source = $null
+        $workingBitmap = $null
+        $canvas = $null
+        $graphics = $null
+
+        try {
+            Write-Progress `
+                -Activity 'Обработка изображений' `
+                -Status "$index из $($files.Count): $($file.Name)" `
+                -PercentComplete (($index / [double]$files.Count) * 100)
+
+            $source = [System.Drawing.Image]::FromFile($file.FullName)
+            Apply-ExifOrientation -Image $source
+            $workingBitmap = New-Object System.Drawing.Bitmap($source)
+
+            [int]$sourceWidth = $workingBitmap.Width
+            [int]$sourceHeight = $workingBitmap.Height
+
+            [double]$scale = [Math]::Min(
+                $outputSize / [double]$sourceWidth,
+                $outputSize / [double]$sourceHeight
+            )
+
+            [int]$drawWidth = [Math]::Max(
+                1,
+                [int][Math]::Round($sourceWidth * $scale)
+            )
+
+            [int]$drawHeight = [Math]::Max(
+                1,
+                [int][Math]::Round($sourceHeight * $scale)
+            )
+
+            [int]$drawX = [int][Math]::Floor(
+                ($outputSize - $drawWidth) / 2.0
+            )
+
+            [int]$drawY = [int][Math]::Floor(
+                ($outputSize - $drawHeight) / 2.0
+            )
+
+            [bool]$padLeftRight = $drawWidth -lt $outputSize
+            $direction =
+                if ($padLeftRight) {
+                    'Horizontal'
+                }
+                else {
+                    'Vertical'
+                }
+
+            if ($fillMode -eq 'manual') {
+                $firstColor = $manualColor
+                $secondColor = $manualColor
+            }
+            elseif ($fillMode -eq 'rowmatch') {
+                # В rowmatch цвета рассчитываются отдельно для каждой строки
+                # или каждого столбца после создания объекта Graphics.
+                $firstColor = [System.Drawing.Color]::White
+                $secondColor = [System.Drawing.Color]::White
+            }
+            elseif ($padLeftRight) {
+                $firstColor = Get-EdgeAverageColor `
+                    -Bitmap $workingBitmap `
+                    -Edge 'Left' `
+                    -SampleSize $sampleSize
+
+                $secondColor = Get-EdgeAverageColor `
+                    -Bitmap $workingBitmap `
+                    -Edge 'Right' `
+                    -SampleSize $sampleSize
+            }
+            else {
+                $firstColor = Get-EdgeAverageColor `
+                    -Bitmap $workingBitmap `
+                    -Edge 'Top' `
+                    -SampleSize $sampleSize
+
+                $secondColor = Get-EdgeAverageColor `
+                    -Bitmap $workingBitmap `
+                    -Edge 'Bottom' `
+                    -SampleSize $sampleSize
+            }
+
+            $canvas = New-Object System.Drawing.Bitmap(
+                $outputSize,
+                $outputSize,
+                [System.Drawing.Imaging.PixelFormat]::Format24bppRgb
+            )
+
+            $graphics = [System.Drawing.Graphics]::FromImage($canvas)
+            $graphics.CompositingQuality =
+                [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+            $graphics.InterpolationMode =
+                [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $graphics.PixelOffsetMode =
+                [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $graphics.SmoothingMode =
+                [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+
+            if ($fillMode -eq 'rowmatch') {
+                Fill-RowMatchBackground `
+                    -Graphics $graphics `
+                    -SourceBitmap $workingBitmap `
+                    -CanvasSize $outputSize `
+                    -DrawX $drawX `
+                    -DrawY $drawY `
+                    -DrawWidth $drawWidth `
+                    -DrawHeight $drawHeight `
+                    -SampleSize $sampleSize `
+                    -PadLeftRight $padLeftRight
+            }
+            else {
+                Fill-Background `
+                    -Graphics $graphics `
+                    -CanvasSize $outputSize `
+                    -FillMode $fillMode `
+                    -Direction $direction `
+                    -FirstColor $firstColor `
+                    -SecondColor $secondColor `
+                    -ManualColor $manualColor
+            }
+
+            $destination = New-Object System.Drawing.Rectangle(
+                $drawX,
+                $drawY,
+                $drawWidth,
+                $drawHeight
+            )
+
+            $graphics.DrawImage($workingBitmap, $destination)
+            $graphics.Dispose()
+            $graphics = $null
+
+            $outputPath = Join-Path -Path $outputFull -ChildPath $file.Name
+
+            if (Test-Path -LiteralPath $outputPath -PathType Leaf) {
+                Remove-Item -LiteralPath $outputPath -Force
+            }
+
+            if ($file.Extension.ToLowerInvariant() -in
+                @('.jpg', '.jpeg', '.jfif')) {
+                Save-Jpeg `
+                    -Bitmap $canvas `
+                    -Path $outputPath `
+                    -Quality $jpegQuality
+            }
+            else {
+                $canvas.Save(
+                    $outputPath,
+                    [System.Drawing.Imaging.ImageFormat]::Png
+                )
+            }
+
+            Write-Host "[ГОТОВО] $($file.Name)" -ForegroundColor Green
+            $done++
+        }
+        catch {
+            Write-Host (
+                "[ОШИБКА] {0}: {1}" -f
+                $file.Name,
+                $_.Exception.Message
+            ) -ForegroundColor Red
+
+            if ($_.ScriptStackTrace) {
+                Write-Host "         $($_.ScriptStackTrace)" -ForegroundColor DarkRed
+            }
+
+            $failed++
+        }
+        finally {
+            if ($null -ne $graphics) {
+                $graphics.Dispose()
+            }
+
+            if ($null -ne $canvas) {
+                $canvas.Dispose()
+            }
+
+            if ($null -ne $workingBitmap) {
+                $workingBitmap.Dispose()
+            }
+
+            if ($null -ne $source) {
+                $source.Dispose()
+            }
+        }
+    }
+
+    Write-Progress -Activity 'Обработка изображений' -Completed
+
+    Write-Host ''
+    Write-Host "Обработано: $done"
+    Write-Host "Ошибок: $failed"
+
+    if ($failed -gt 0) {
+        exit 2
+    }
+
+    exit 0
+}
+catch {
+    Write-Host ''
+    Write-Host "ОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+
+    if ($_.ScriptStackTrace) {
+        Write-Host $_.ScriptStackTrace -ForegroundColor DarkRed
+    }
+
+    exit 1
+}
